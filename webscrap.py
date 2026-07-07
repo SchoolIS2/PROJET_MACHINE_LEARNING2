@@ -59,9 +59,6 @@ except ImportError:
     HAS_SPELLCHECKER = False
 
 
-# ---------------------------------------------------------------------------
-# 2) NETTOYAGE + COMPRÉHENSION / CORRECTION ORTHOGRAPHIQUE
-# ---------------------------------------------------------------------------
 
 def strip_accents(text: str) -> str:
     """Retire les accents pour faciliter les comparaisons (motre/montre...)."""
@@ -199,3 +196,181 @@ def print_understanding_report(raw_text: str, suggestions: List[SpellSuggestion]
         else:
             print(f"  • '{s.original}' -> gardé tel quel")
     print("—" * 60)
+
+import os
+import re
+import time
+from dataclasses import dataclass
+from typing import List, Optional
+from urllib.parse import quote_plus, urljoin
+
+import requests
+from bs4 import BeautifulSoup
+
+# from config import JUMIA_BASE_URL, JUMIA_SEARCH_URL, HEADERS   # <-- décommenter une fois séparé
+
+
+
+@dataclass
+class Produit:
+    nom: str
+    lien: str
+    images: List[str]
+
+
+def build_search_url(query: str) -> str:
+    return JUMIA_SEARCH_URL.format(query=quote_plus(query))
+
+
+def _extract_image_url(img_tag) -> Optional[str]:
+    """
+    Les images de produits sur les sites Jumia sont très souvent
+    chargées en 'lazy loading' : l'attribut src pointe parfois vers un
+    minuscule placeholder, et la vraie image est dans data-src (ou
+    parfois data-srcset / srcset). On essaie plusieurs attributs.
+    """
+    for attr in ("data-src", "data-srcset", "srcset", "src"):
+        val = img_tag.get(attr)
+        if val:
+            # srcset peut contenir plusieurs URLs séparées par des virgules
+            first_url = val.split(",")[0].strip().split(" ")[0]
+            if first_url.startswith("//"):
+                first_url = "https:" + first_url
+            if first_url.startswith("http"):
+                return first_url
+    return None
+
+
+def scrape_with_requests(query: str, max_items: int = 10) -> List[Produit]:
+    """
+    Scraping "classique" via requests + BeautifulSoup.
+    Fonctionne si la page de résultats est pré-rendue côté serveur
+    (c'est généralement le cas pour les pages catalogue/mlp/slp Jumia).
+    """
+    url = build_search_url(query)
+    produits: List[Produit] = []
+
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"[!] Erreur réseau lors de la requête vers Jumia : {e}")
+        return produits
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Les cartes produits Jumia sont en général des balises <article class="prd ...">
+    # contenant un lien <a class="core"> et une image <img>.
+    cards = soup.select("article.prd") or soup.select("a.core")
+
+    for card in cards[:max_items]:
+        link_tag = card if card.name == "a" else card.select_one("a.core, a[href]")
+        img_tag = card.select_one("img")
+
+        if not link_tag or not img_tag:
+            continue
+
+        lien = link_tag.get("href", "")
+        if lien and not lien.startswith("http"):
+            lien = urljoin(JUMIA_BASE_URL, lien)
+
+        nom_tag = card.select_one("h3.name, .name")
+        nom = nom_tag.get_text(strip=True) if nom_tag else query
+
+        image_url = _extract_image_url(img_tag)
+        images = [image_url] if image_url else []
+
+        produits.append(Produit(nom=nom, lien=lien, images=images))
+
+    return produits
+
+
+def scrape_with_selenium(query: str, max_items: int = 10) -> List[Produit]:
+    """
+    Mode de secours : si scrape_with_requests() ne renvoie rien
+    (page rendue en JavaScript, contenu chargé dynamiquement, etc.),
+    on ouvre un vrai navigateur headless pour laisser le JS s'exécuter
+    avant de récupérer le HTML final.
+
+    Nécessite : pip install selenium webdriver-manager
+    """
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
+        from webdriver_manager.chrome import ChromeDriverManager
+    except ImportError:
+        print("[!] Selenium/webdriver-manager non installés. "
+              "Faites : pip install selenium webdriver-manager")
+        return []
+
+    url = build_search_url(query)
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument(f"user-agent={HEADERS['User-Agent']}")
+
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()), options=options
+    )
+    produits: List[Produit] = []
+    try:
+        driver.get(url)
+        time.sleep(3)  # laisser le temps au JS de charger les produits
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        cards = soup.select("article.prd") or soup.select("a.core")
+
+        for card in cards[:max_items]:
+            link_tag = card if card.name == "a" else card.select_one("a.core, a[href]")
+            img_tag = card.select_one("img")
+            if not link_tag or not img_tag:
+                continue
+
+            lien = link_tag.get("href", "")
+            if lien and not lien.startswith("http"):
+                lien = urljoin(JUMIA_BASE_URL, lien)
+
+            nom_tag = card.select_one("h3.name, .name")
+            nom = nom_tag.get_text(strip=True) if nom_tag else query
+
+            image_url = _extract_image_url(img_tag)
+            images = [image_url] if image_url else []
+
+            produits.append(Produit(nom=nom, lien=lien, images=images))
+    finally:
+        driver.quit()
+
+    return produits
+
+
+def scrape_jumia_images(query: str, max_items: int = 10) -> List[Produit]:
+    """
+    Point d'entrée principal du scraping : essaie d'abord requests,
+    puis bascule automatiquement sur Selenium si rien n'est trouvé.
+    """
+    produits = scrape_with_requests(query, max_items=max_items)
+    if not produits:
+        print("[i] Aucun résultat via requests seul, tentative avec "
+              "un navigateur headless (Selenium)...")
+        produits = scrape_with_selenium(query, max_items=max_items)
+    return produits
+    
+#  TÉLÉCHARGEMENT DES IMAGES (OPTIONNEL)
+def download_images(produits: List[Produit], dossier: str = "images_jumia"):
+    os.makedirs(dossier, exist_ok=True)
+    compteur = 0
+    for produit in produits:
+        for img_url in produit.images:
+            try:
+                resp = requests.get(img_url, headers=HEADERS, timeout=15)
+                resp.raise_for_status()
+                ext = os.path.splitext(img_url.split("?")[0])[1] or ".jpg"
+                nom_fichier = re.sub(r"[^a-zA-Z0-9_-]", "_", produit.nom)[:50]
+                chemin = os.path.join(dossier, f"{nom_fichier}_{compteur}{ext}")
+                with open(chemin, "wb") as f:
+                    f.write(resp.content)
+                print(f"  ✓ Image téléchargée : {chemin}")
+                compteur += 1
+            except requests.RequestException as e:
+                print(f"  ✗ Échec du téléchargement de {img_url} : {e}")
