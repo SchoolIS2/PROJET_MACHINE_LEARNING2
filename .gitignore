@@ -22,3 +22,10 @@ staticfiles/
 *.pth
 *.h5
 .ipynb_checkpoints/
+
+# Datasets (jamais sur GitHub - trop volumineux)
+data/
+*.zip
+
+# Fichiers locaux divers
+projet_ISE2 .md
